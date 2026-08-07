@@ -11,8 +11,11 @@ use crate::{
     },
 };
 
+pub mod callgraph;
 pub mod cfa;
 pub mod executor;
+pub mod fingerprint;
+pub mod matching;
 pub mod objects;
 pub mod pass;
 pub mod signatures;

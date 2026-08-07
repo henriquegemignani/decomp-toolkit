@@ -36,11 +36,13 @@ project structure and build system that uses decomp-toolkit under the hood.
   - [elf fixup](#elf-fixup)
   - [elf2dol](#elf2dol)
   - [map](#map)
+  - [match](#match)
   - [rel info](#rel-info)
   - [rel merge](#rel-merge)
   - [rso info](#rso-info)
   - [rso make](#rso-make)
   - [shasum](#shasum)
+  - [symbols rename](#symbols-rename)
   - [nlzss decompress](#nlzss-decompress)
   - [rarc list](#rarc-list)
   - [rarc extract](#rarc-extract)
@@ -351,6 +353,35 @@ $ dtk map symbol Game.MAP 'Function__5ClassFv'
 # in a readable format.
 ```
 
+### match
+
+Matches functions between two versions of the same executable, carrying symbol names from a version
+you've already named across to one you haven't.
+
+Pass in two project configuration files: the source (the version with known names), then the target.
+
+Matches are classified by the kind of evidence behind it:
+
+- **confident** — decided by content unique to the pair, or an identical body backed by call-graph
+  agreement. Safe to apply unreviewed.
+- **probable** — several independent neighbours agree and nothing else came close.
+- **candidate** — thin or contested evidence, reported with its alternatives.
+
+Options:
+- `-o`, `--output <File>`: Output JSON report, with every match, its tier, confidence and the evidence behind it.
+- `-r`, `--renames <File>`: Output `target_name = source_name` pairs for confident matches only, for target functions that currently have a generated name.
+- `--candidates <File>`: Output everything short of confident, with alternatives, for review.
+- `-c`, `--min-confidence <Float>`: Minimum confidence to report a match at all. Default: 0.5
+- `--max-rounds <Int>`: Cap on propagation rounds. Default: 100. Propagation stops on its own once a round finds nothing.
+- `--source-root <Dir>`, `--target-root <Dir>`: Project root each configuration's relative paths resolve against. Defaults to the working directory, falling back to the configuration's own location.
+- `--validate`: Ignore the target's existing names while matching, then score the result against them. Use on an already-named version to measure accuracy.
+
+```shell
+$ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml \
+    -r renames.txt --candidates candidates.txt
+$ dtk symbols rename config/GM8E01_02/symbols.txt renames.txt
+```
+
 ### rel info
 
 Prints information about a REL file.
@@ -409,6 +440,26 @@ $ dtk shasum baserom.dol
 
 $ dtk shasum -c baserom.sha1 
 baserom.dol: OK
+```
+
+### symbols rename
+
+Applies `old_name = new_name` pairs to a symbols file, in place.
+
+Rewrites names line by line, so addresses, attributes, ordering and formatting survive untouched and
+the resulting diff shows only the names that changed. A rename whose new name is already taken by a
+symbol that isn't being renamed away is skipped and reported, rather than leaving two symbols with
+one name.
+
+Anything after a `#` is a comment, so the [match](#match) candidates file can be applied directly
+once you've deleted the entries you don't want.
+
+Options:
+- `-n`, `--dry-run`: Report what would change without writing.
+
+```shell
+$ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml -r renames.txt
+$ dtk symbols rename config/GM8E01_02/symbols.txt renames.txt
 ```
 
 ### nlzss decompress

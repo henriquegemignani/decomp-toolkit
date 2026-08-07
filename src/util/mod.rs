@@ -22,6 +22,7 @@ pub mod rarc;
 pub mod read;
 pub mod reader;
 pub mod rel;
+pub mod renames;
 pub mod rso;
 pub mod signatures;
 pub mod split;

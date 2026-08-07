@@ -13,6 +13,8 @@ pub mod rarc;
 pub mod rel;
 pub mod rso;
 pub mod shasum;
+pub mod symbol_match;
+pub mod symbols;
 pub mod u8_arc;
 pub mod vfs;
 pub mod wad;
