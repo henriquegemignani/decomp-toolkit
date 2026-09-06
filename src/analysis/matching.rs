@@ -48,6 +48,25 @@ impl MatchTarget {
     pub fn is_named(&self, node: NodeIndex) -> bool {
         !is_auto_symbol(&self.obj.symbols[self.graph.node(node).symbol])
     }
+
+    /// Whether this function's symbol is marked local scope.
+    pub fn is_local(&self, node: NodeIndex) -> bool {
+        self.obj.symbols[self.graph.node(node).symbol].flags.is_local()
+    }
+
+    /// The split unit this function currently belongs to, if its section has
+    /// a split covering its address.
+    pub fn unit_of(&self, node: NodeIndex) -> Option<&str> {
+        let n = self.graph.node(node);
+        let section = self.obj.sections.get(n.section)?;
+        section.splits.for_address(n.address).map(|(_, split)| split.unit.as_str())
+    }
+
+    /// Nodes in link order, i.e. sorted by section then address.
+    pub fn layout(&self) -> &[NodeIndex] { &self.layout }
+
+    /// Position of `node` within [`Self::layout`].
+    pub fn layout_position(&self, node: NodeIndex) -> u32 { self.layout_position[node as usize] }
 }
 
 /// How a pair of functions was matched, in decreasing order of directness.

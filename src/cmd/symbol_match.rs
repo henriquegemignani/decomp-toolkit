@@ -14,6 +14,7 @@ use crate::{
     analysis::{
         matching::{MatchOptions, MatchResult, MatchTarget, MatchTier, match_functions},
         tracker::Tracker,
+        unit_matching::{UnitProposal, UnitTier, propose_units},
     },
     cmd::dol::{ObjectBase, ProjectConfig, find_object_base, load_analyze_dol},
     obj::ObjInfo,
@@ -45,6 +46,11 @@ pub struct Args {
     /// write everything short of confident to this path, with alternatives, for
     /// review. Never mixed into --renames
     candidates: Option<Utf8NativePathBuf>,
+    #[argp(option, from_str_fn(native_path))]
+    /// write proposed split-unit boundaries to this path, grouped by unit and
+    /// in splits.txt syntax. Confident entries are ready to paste in;
+    /// candidates are commented out with the reason they weren't confident
+    splits: Option<Utf8NativePathBuf>,
     #[argp(option, short = 'c')]
     /// minimum confidence for a match to be reported (default 0.5)
     min_confidence: Option<f32>,
@@ -98,7 +104,11 @@ pub fn run(args: Args) -> Result<()> {
         let mut file = buf_writer(path)?;
         let mut count = 0;
         for m in report.renameable().filter(|m| m.tier == MatchTier::Confident) {
-            writeln!(file, "{} = {}", m.target_name, m.source_name)?;
+            write!(file, "{} = {}", m.target_name, m.source_name)?;
+            if m.source_local {
+                write!(file, " local")?;
+            }
+            writeln!(file)?;
             count += 1;
         }
         file.flush()?;
@@ -133,9 +143,10 @@ pub fn run(args: Args) -> Result<()> {
 
         let mut count = 0;
         for m in pending {
+            let local = if m.source_local { " local" } else { "" };
             writeln!(
                 file,
-                "{} = {}  # {} {:.2} {}",
+                "{} = {}{local}  # {} {:.2} {}",
                 m.target_name,
                 m.source_name,
                 m.tier.as_str(),
@@ -157,6 +168,61 @@ pub fn run(args: Args) -> Result<()> {
         file.flush()?;
         info!("Wrote {} candidates to {}", count, path);
     }
+    if let Some(path) = &args.splits {
+        let proposals = propose_units(&source, &target, &result);
+        write_unit_proposals(path, &target, &proposals)?;
+    }
+    Ok(())
+}
+
+/// Writes proposed split boundaries in splits.txt syntax, grouped by unit.
+/// Confident entries are real lines; candidates are commented out with the
+/// reason they weren't confident, so the file is ready to paste from once
+/// reviewed.
+fn write_unit_proposals(
+    path: &Utf8NativePath,
+    target: &MatchTarget,
+    proposals: &[UnitProposal],
+) -> Result<()> {
+    let mut file = buf_writer(path)?;
+    writeln!(file, "# Proposed split boundaries, derived from function matches.")?;
+    writeln!(file, "#")?;
+    writeln!(file, "# Confident entries are ready to paste into a splits.txt. Candidates are")?;
+    writeln!(file, "# commented out, with the reason they weren't confident; review before")?;
+    writeln!(file, "# uncommenting.")?;
+    writeln!(file)?;
+
+    let mut by_unit: BTreeMap<&str, Vec<&UnitProposal>> = BTreeMap::new();
+    for p in proposals {
+        by_unit.entry(p.unit.as_str()).or_default().push(p);
+    }
+
+    let (mut confident, mut candidates) = (0, 0);
+    for (unit, entries) in by_unit {
+        writeln!(file, "{unit}:")?;
+        for p in entries {
+            let section_name =
+                target.obj.sections.get(p.section).map(|s| s.name.as_str()).unwrap_or("?");
+            let line =
+                format!("\t{:<11} start:{:#010X} end:{:#010X}", section_name, p.start, p.end);
+            match p.tier {
+                UnitTier::Confident => {
+                    writeln!(file, "{line}")?;
+                    confident += 1;
+                }
+                UnitTier::Candidate => {
+                    writeln!(file, "#{line}  # candidate: {}", p.reasons.join("; "))?;
+                    candidates += 1;
+                }
+            }
+        }
+        writeln!(file)?;
+    }
+    file.flush()?;
+    info!(
+        "Wrote {} confident and {} candidate split boundaries to {}",
+        confident, candidates, path
+    );
     Ok(())
 }
 
@@ -303,6 +369,10 @@ struct TierAccuracy {
 #[derive(Serialize)]
 struct ReportMatch {
     source_name: String,
+    /// Whether the source symbol is marked local scope, e.g. a per-translation-unit
+    /// template instantiation. Carried onto a rename so the target gets the
+    /// same scope, rather than every duplicate ending up global.
+    source_local: bool,
     #[serde(serialize_with = "hex")]
     source_address: u32,
     target_name: String,
@@ -358,6 +428,7 @@ impl Report {
 
             matches.push(ReportMatch {
                 source_name,
+                source_local: source.is_local(m.source),
                 source_address: source.graph.node(m.source).address,
                 target_name,
                 target_address: target.graph.node(m.target).address,

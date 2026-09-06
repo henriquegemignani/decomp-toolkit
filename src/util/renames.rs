@@ -8,6 +8,19 @@ use typed_path::Utf8NativePath;
 
 use crate::{util::file::buf_writer, vfs::open_file};
 
+/// One rename's destination: the new name, and whether it should carry
+/// `scope:local`.
+///
+/// Copied straight from the source symbol per match rather than inferred at
+/// the target: which duplicate of a repeated template instantiation stays
+/// global isn't consistent between binaries, so NTSC and PAL can disagree
+/// on the same function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenameTarget {
+    name: String,
+    local: bool,
+}
+
 /// A set of `target_name = source_name` pairs, as written by `dtk match`.
 ///
 /// Anything from a `#` onward is a comment. That makes the candidates file a
@@ -18,7 +31,7 @@ use crate::{util::file::buf_writer, vfs::open_file};
 pub struct Renames {
     /// Keyed by the name to replace, since that's what a symbols file is
     /// scanned by.
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, RenameTarget>,
 }
 
 impl Renames {
@@ -28,35 +41,29 @@ impl Renames {
     /// Adds one pair, refusing only what would corrupt the set.
     ///
     /// Two entries assigning the same target name are allowed: local template
-    /// instantiations legitimately repeat their mangled name across
-    /// translation units — `GM8E01_00` has 12 such function names — so a set
+    /// instantiations repeat a mangled name across translation units, so a set
     /// derived from a one-to-one function matching reproduces the source's own
-    /// duplicates, and refusing them would drop correct renames. What actually
-    /// collides two live symbols under one name is caught in [`apply_renames`]
-    /// instead, where the target's existing names are visible.
+    /// duplicates. An actual collision between two live symbols is caught in
+    /// [`apply_renames`] instead, where the target's existing names are
+    /// visible.
     ///
     /// `origin` names the source of the pair for error messages.
-    fn insert(&mut self, from: &str, to: &str, origin: &str) -> Result<()> {
+    fn insert(&mut self, from: &str, to: &str, local: bool, origin: &str) -> Result<()> {
         match self.entries.entry(from.to_string()) {
             btree_map::Entry::Vacant(e) => {
-                e.insert(to.to_string());
+                e.insert(RenameTarget { name: to.to_string(), local });
             }
             btree_map::Entry::Occupied(e) => {
-                bail!("{origin}: '{from}' is renamed twice, to '{}' and '{to}'.", e.get())
+                bail!("{origin}: '{from}' is renamed twice, to '{}' and '{to}'.", e.get().name)
             }
         }
         Ok(())
     }
 
-    pub fn from_pairs<I>(pairs: I) -> Result<Self>
-    where I: IntoIterator<Item = (String, String)> {
-        let mut renames = Self::default();
-        for (from, to) in pairs {
-            renames.insert(&from, &to, "Rename set")?;
-        }
-        Ok(renames)
-    }
-
+    /// Parses `target = source` pairs, one per line, as written by `dtk
+    /// match`. Anything from a `#` onward is a comment. A source name may be
+    /// followed by the bare word `local` to carry `scope:local` onto the
+    /// target when applied.
     pub fn parse(text: &str) -> Result<Self> {
         let mut renames = Self::default();
         for (number, line) in text.lines().enumerate() {
@@ -71,7 +78,18 @@ impl Renames {
                 .with_context(|| {
                     format!("Line {}: expected `old_name = new_name`, got '{line}'", number + 1)
                 })?;
-            renames.insert(from, to, &format!("Line {}", number + 1))?;
+            let mut words = to.split_whitespace();
+            // `to` is non-empty, so a first word always exists.
+            let to_name = words.next().unwrap();
+            let local = match words.next() {
+                None => false,
+                Some("local") if words.next().is_none() => true,
+                Some(other) => bail!(
+                    "Line {}: expected 'local' or nothing after '{to_name}', got '{other}'",
+                    number + 1
+                ),
+            };
+            renames.insert(from, to_name, local, &format!("Line {}", number + 1))?;
         }
         Ok(renames)
     }
@@ -140,18 +158,26 @@ pub fn apply_renames(
             out.push_str(line);
             continue;
         };
-        let Some(new_name) = renames.entries.get(name) else {
+        let Some(target) = renames.entries.get(name) else {
             out.push_str(line);
             continue;
         };
-        if taken.contains_key(new_name.as_str()) {
-            report.collisions.push((name.to_string(), new_name.clone()));
+        // A local rename is exactly the case that's supposed to coexist with
+        // whatever else already holds the name: that's what marked it local
+        // in the first place. Only a global rename actually collides.
+        if !target.local && taken.contains_key(target.name.as_str()) {
+            report.collisions.push((name.to_string(), target.name.clone()));
             out.push_str(line);
             continue;
         }
         seen.insert(name, ());
-        out.push_str(new_name);
-        out.push_str(&line[name.len()..]);
+        out.push_str(&target.name);
+        let rest = &line[name.len()..];
+        if target.local {
+            out.push_str(&ensure_scope_local(rest));
+        } else {
+            out.push_str(rest);
+        }
         report.applied += 1;
     }
 
@@ -169,6 +195,26 @@ pub fn apply_renames(
         file.flush()?;
     }
     Ok(report)
+}
+
+/// Adds `scope:local` to a symbol line's attributes, unless it already
+/// declares a scope explicitly — a human-authored scope is left alone rather
+/// than second-guessed. `rest` is everything from the `=` onward, i.e.
+/// ` = .text:0x80000000; // type:function size:0x28`, possibly with a
+/// trailing `\r`.
+fn ensure_scope_local(rest: &str) -> String {
+    if rest.contains("scope:") {
+        return rest.to_string();
+    }
+    let (body, crlf) = match rest.strip_suffix('\r') {
+        Some(body) => (body, "\r"),
+        None => (rest, ""),
+    };
+    if body.contains("//") {
+        format!("{body} scope:local{crlf}")
+    } else {
+        format!("{body} // scope:local{crlf}")
+    }
 }
 
 /// The symbol name a symbols-file line declares, if it declares one.
@@ -189,7 +235,21 @@ mod tests {
     fn parses_plain_pairs() {
         let renames = Renames::parse("fn_8000 = Foo\nfn_8004 = Bar\n").unwrap();
         assert_eq!(renames.len(), 2);
-        assert_eq!(renames.entries["fn_8000"], "Foo");
+        assert_eq!(renames.entries["fn_8000"].name, "Foo");
+        assert!(!renames.entries["fn_8000"].local);
+    }
+
+    #[test]
+    fn parses_a_local_marker() {
+        let renames = Renames::parse("fn_8000 = Foo local\n").unwrap();
+        assert_eq!(renames.entries["fn_8000"].name, "Foo");
+        assert!(renames.entries["fn_8000"].local);
+    }
+
+    #[test]
+    fn rejects_trailing_text_that_isnt_local() {
+        assert!(Renames::parse("fn_8000 = Foo bogus\n").is_err());
+        assert!(Renames::parse("fn_8000 = Foo local extra\n").is_err());
     }
 
     #[test]
@@ -204,7 +264,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(renames.len(), 1);
-        assert_eq!(renames.entries["fn_80179620"], "RenderMotionBlur__17CPlasmaProjectileCFv");
+        assert_eq!(renames.entries["fn_80179620"].name, "RenderMotionBlur__17CPlasmaProjectileCFv");
     }
 
     #[test]
@@ -213,8 +273,8 @@ mod tests {
         // rename set derived from a real binary contains these legitimately.
         let renames = Renames::parse("fn_8000 = Foo\nfn_8004 = Foo\n").unwrap();
         assert_eq!(renames.len(), 2);
-        assert_eq!(renames.entries["fn_8000"], "Foo");
-        assert_eq!(renames.entries["fn_8004"], "Foo");
+        assert_eq!(renames.entries["fn_8000"].name, "Foo");
+        assert_eq!(renames.entries["fn_8004"].name, "Foo");
     }
 
     #[test]
@@ -227,6 +287,33 @@ mod tests {
     fn rejects_a_malformed_line() {
         assert!(Renames::parse("this is not a pair\n").is_err());
         assert!(Renames::parse("fn_8000 =\n").is_err());
+    }
+
+    #[test]
+    fn ensure_scope_local_adds_the_attribute_once() {
+        assert_eq!(
+            ensure_scope_local(" = .text:0x80000000; // type:function size:0x28"),
+            " = .text:0x80000000; // type:function size:0x28 scope:local"
+        );
+        // No existing comment to extend: add one.
+        assert_eq!(
+            ensure_scope_local(" = .text:0x80000000;"),
+            " = .text:0x80000000; // scope:local"
+        );
+    }
+
+    #[test]
+    fn ensure_scope_local_leaves_an_explicit_scope_alone() {
+        let line = " = .text:0x80000000; // type:function scope:global";
+        assert_eq!(ensure_scope_local(line), line);
+    }
+
+    #[test]
+    fn ensure_scope_local_preserves_a_trailing_cr() {
+        assert_eq!(
+            ensure_scope_local(" = .text:0x80000000; // type:function\r"),
+            " = .text:0x80000000; // type:function scope:local\r"
+        );
     }
 
     #[test]

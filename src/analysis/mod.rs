@@ -21,6 +21,7 @@ pub mod pass;
 pub mod signatures;
 pub mod slices;
 pub mod tracker;
+pub mod unit_matching;
 pub mod vm;
 
 pub fn disassemble(section: &ObjSection, address: u32) -> Option<Ins> {

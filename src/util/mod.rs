@@ -26,6 +26,7 @@ pub mod renames;
 pub mod rso;
 pub mod signatures;
 pub mod split;
+pub mod split_merge;
 pub mod take_seek;
 pub mod toposort;
 pub mod u8_arc;

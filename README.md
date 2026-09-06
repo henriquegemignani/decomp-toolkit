@@ -43,6 +43,7 @@ project structure and build system that uses decomp-toolkit under the hood.
   - [rso make](#rso-make)
   - [shasum](#shasum)
   - [symbols rename](#symbols-rename)
+  - [splits merge](#splits-merge)
   - [nlzss decompress](#nlzss-decompress)
   - [rarc list](#rarc-list)
   - [rarc extract](#rarc-extract)
@@ -369,8 +370,9 @@ Matches are classified by the kind of evidence behind it:
 
 Options:
 - `-o`, `--output <File>`: Output JSON report, with every match, its tier, confidence and the evidence behind it.
-- `-r`, `--renames <File>`: Output `target_name = source_name` pairs for confident matches only, for target functions that currently have a generated name.
+- `-r`, `--renames <File>`: Output `target_name = source_name` pairs for confident matches only, for target functions that currently have a generated name. A source symbol marked local scope (e.g. a per-translation-unit template instantiation) carries a trailing `local` word, so the same name can be assigned more than once without colliding.
 - `--candidates <File>`: Output everything short of confident, with alternatives, for review.
+- `--splits <File>`: Output proposed split-unit boundaries, derived from the function matches. See below.
 - `-c`, `--min-confidence <Float>`: Minimum confidence to report a match at all. Default: 0.5
 - `--max-rounds <Int>`: Cap on propagation rounds. Default: 100. Propagation stops on its own once a round finds nothing.
 - `--source-root <Dir>`, `--target-root <Dir>`: Project root each configuration's relative paths resolve against. Defaults to the working directory, falling back to the configuration's own location.
@@ -380,6 +382,25 @@ Options:
 $ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml \
     -r renames.txt --candidates candidates.txt
 $ dtk symbols rename config/GM8E01_02/symbols.txt renames.txt
+```
+
+`--splits` carries over the unit each matched function already belongs to in the source, proposing a
+boundary for every run of consecutive target functions attributed to the same unit. Only `.text`
+ranges are proposed; `.data`/`.rodata`/`.bss` are left to a human — and since migrating the code
+without a source unit's data would link with that data still claimed under another name, a unit with
+anything outside `.text` in the source is never confident, only a candidate. Likewise a run with any
+member matched below the confident tier. Output is `splits.txt` syntax, grouped by unit, with
+anything short of confident commented out and tagged with the reason:
+
+```
+CPlayer:
+	.text       start:0x80123450 end:0x80123900
+#	.text       start:0x80123900 end:0x80123a10  # candidate: right edge borders an unmatched function
+```
+
+```shell
+$ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml --splits splits_proposal.txt
+$ dtk splits merge config/GM8E01_02/splits.txt splits_proposal.txt
 ```
 
 ### rel info
@@ -449,7 +470,8 @@ Applies `old_name = new_name` pairs to a symbols file, in place.
 Rewrites names line by line, so addresses, attributes, ordering and formatting survive untouched and
 the resulting diff shows only the names that changed. A rename whose new name is already taken by a
 symbol that isn't being renamed away is skipped and reported, rather than leaving two symbols with
-one name.
+one name — unless the rename is marked `local` (see [match](#match)'s `-r`), since a local symbol
+coexisting under a shared name is exactly what marked it local in the first place.
 
 Anything after a `#` is a comment, so the [match](#match) candidates file can be applied directly
 once you've deleted the entries you don't want.
@@ -460,6 +482,20 @@ Options:
 ```shell
 $ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml -r renames.txt
 $ dtk symbols rename config/GM8E01_02/symbols.txt renames.txt
+```
+
+### splits merge
+
+Merges the confident units from a [match](#match) `--splits` proposal into a splits file, in place,
+in address order. A proposed unit whose name already has a block in the target file is left
+untouched and reported, rather than overwritten or duplicated.
+
+Options:
+- `-n`, `--dry-run`: Report what would change without writing.
+
+```shell
+$ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml --splits splits_proposal.txt
+$ dtk splits merge config/GM8E01_02/splits.txt splits_proposal.txt
 ```
 
 ### nlzss decompress
