@@ -12,6 +12,7 @@ use typed_path::{Utf8NativePath, Utf8NativePathBuf};
 
 use crate::{
     analysis::{
+        data_matching::{DataMatch, match_data},
         matching::{MatchOptions, MatchResult, MatchTarget, MatchTier, match_functions},
         tracker::Tracker,
         unit_matching::{UnitProposal, UnitTier, propose_units},
@@ -91,6 +92,7 @@ pub fn run(args: Args) -> Result<()> {
     info!("Matching {} functions against {} functions", source.graph.len(), target.graph.len());
 
     let result = match_functions(&source, &target, &options);
+    let data_matches = match_data(&source, &target, &result);
     let report = Report::build(&source, &target, &result, args.validate);
     report.print_summary();
 
@@ -111,8 +113,22 @@ pub fn run(args: Args) -> Result<()> {
             writeln!(file)?;
             count += 1;
         }
+        let mut data_count = 0;
+        for dm in renameable_data(&source, &target, &data_matches) {
+            write!(
+                file,
+                "{} = {}",
+                target.symbol_name_at(dm.target),
+                source.symbol_name_at(dm.source)
+            )?;
+            if source.is_local_at(dm.source) {
+                write!(file, " local")?;
+            }
+            writeln!(file)?;
+            data_count += 1;
+        }
         file.flush()?;
-        info!("Wrote {} confident renames to {}", count, path);
+        info!("Wrote {} confident renames ({} data) to {}", count + data_count, data_count, path);
     }
     if let Some(path) = &args.candidates {
         let mut file = buf_writer(path)?;
@@ -169,10 +185,22 @@ pub fn run(args: Args) -> Result<()> {
         info!("Wrote {} candidates to {}", count, path);
     }
     if let Some(path) = &args.splits {
-        let proposals = propose_units(&source, &target, &result);
+        let proposals = propose_units(&source, &target, &result, &data_matches);
         write_unit_proposals(path, &target, &proposals)?;
     }
     Ok(())
+}
+
+/// Data matches that would give a currently-unnamed target symbol a name.
+fn renameable_data<'a>(
+    source: &MatchTarget,
+    target: &MatchTarget,
+    data_matches: &'a [DataMatch],
+) -> Vec<&'a DataMatch> {
+    data_matches
+        .iter()
+        .filter(|dm| source.is_named_at(dm.source) && !target.is_named_at(dm.target))
+        .collect()
 }
 
 /// Writes proposed split boundaries in splits.txt syntax, grouped by unit.

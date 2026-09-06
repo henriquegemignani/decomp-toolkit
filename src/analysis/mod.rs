@@ -13,6 +13,7 @@ use crate::{
 
 pub mod callgraph;
 pub mod cfa;
+pub mod data_matching;
 pub mod executor;
 pub mod fingerprint;
 pub mod matching;

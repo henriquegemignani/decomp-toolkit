@@ -5,7 +5,7 @@ use crate::{
         callgraph::{CallGraph, NodeIndex},
         fingerprint::{Fingerprint, fingerprint_all},
     },
-    obj::ObjInfo,
+    obj::{ObjInfo, SectionIndex, SymbolIndex},
     util::config::is_auto_symbol,
 };
 
@@ -40,26 +40,49 @@ impl MatchTarget {
     }
 
     pub fn symbol_name(&self, node: NodeIndex) -> &str {
-        &self.obj.symbols[self.graph.node(node).symbol].name
+        self.symbol_name_at(self.graph.node(node).symbol)
     }
 
     /// Whether this function carries a real name rather than a `fn_8000XXXX`
     /// placeholder.
     pub fn is_named(&self, node: NodeIndex) -> bool {
-        !is_auto_symbol(&self.obj.symbols[self.graph.node(node).symbol])
+        self.is_named_at(self.graph.node(node).symbol)
     }
 
     /// Whether this function's symbol is marked local scope.
     pub fn is_local(&self, node: NodeIndex) -> bool {
-        self.obj.symbols[self.graph.node(node).symbol].flags.is_local()
+        self.is_local_at(self.graph.node(node).symbol)
     }
 
     /// The split unit this function currently belongs to, if its section has
     /// a split covering its address.
     pub fn unit_of(&self, node: NodeIndex) -> Option<&str> {
         let n = self.graph.node(node);
-        let section = self.obj.sections.get(n.section)?;
-        section.splits.for_address(n.address).map(|(_, split)| split.unit.as_str())
+        self.unit_of_address(n.section, n.address)
+    }
+
+    /// Same as the `NodeIndex`-based accessors above, but for any symbol —
+    /// including a data symbol, which has no call-graph node of its own.
+    pub fn symbol_name_at(&self, symbol: SymbolIndex) -> &str { &self.obj.symbols[symbol].name }
+
+    pub fn is_named_at(&self, symbol: SymbolIndex) -> bool {
+        !is_auto_symbol(&self.obj.symbols[symbol])
+    }
+
+    pub fn is_local_at(&self, symbol: SymbolIndex) -> bool {
+        self.obj.symbols[symbol].flags.is_local()
+    }
+
+    /// The split unit a data symbol currently belongs to, if its section has
+    /// a split covering its address.
+    pub fn unit_of_symbol(&self, symbol: SymbolIndex) -> Option<&str> {
+        let s = &self.obj.symbols[symbol];
+        self.unit_of_address(s.section?, s.address as u32)
+    }
+
+    fn unit_of_address(&self, section: SectionIndex, address: u32) -> Option<&str> {
+        let section = self.obj.sections.get(section)?;
+        section.splits.for_address(address).map(|(_, split)| split.unit.as_str())
     }
 
     /// Nodes in link order, i.e. sorted by section then address.
@@ -689,8 +712,9 @@ fn is_distinctive(source: &Fingerprint, target: &Fingerprint) -> bool {
 }
 
 /// Records a proposed pairing, collapsing to `None` once two proposals for the
-/// same key disagree.
-fn merge_proposal(
+/// same key disagree. Also used by [`crate::analysis::data_matching`], which
+/// faces the same problem pairing data symbols.
+pub(crate) fn merge_proposal(
     proposals: &mut BTreeMap<NodeIndex, Option<NodeIndex>>,
     key: NodeIndex,
     value: NodeIndex,

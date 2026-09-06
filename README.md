@@ -370,7 +370,7 @@ Matches are classified by the kind of evidence behind it:
 
 Options:
 - `-o`, `--output <File>`: Output JSON report, with every match, its tier, confidence and the evidence behind it.
-- `-r`, `--renames <File>`: Output `target_name = source_name` pairs for confident matches only, for target functions that currently have a generated name. A source symbol marked local scope (e.g. a per-translation-unit template instantiation) carries a trailing `local` word, so the same name can be assigned more than once without colliding.
+- `-r`, `--renames <File>`: Output `target_name = source_name` pairs for confident matches only, for target functions that currently have a generated name. Also includes data symbols matched by aligning a confidently-matched function pair's data references. A source symbol marked local scope (e.g. a per-translation-unit template instantiation) carries a trailing `local` word, so the same name can be assigned more than once without colliding.
 - `--candidates <File>`: Output everything short of confident, with alternatives, for review.
 - `--splits <File>`: Output proposed split-unit boundaries, derived from the function matches. See below.
 - `-c`, `--min-confidence <Float>`: Minimum confidence to report a match at all. Default: 0.5
@@ -384,13 +384,13 @@ $ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml \
 $ dtk symbols rename config/GM8E01_02/symbols.txt renames.txt
 ```
 
-`--splits` carries over the unit each matched function already belongs to in the source, proposing a
-boundary for every run of consecutive target functions attributed to the same unit. Only `.text`
-ranges are proposed; `.data`/`.rodata`/`.bss` are left to a human — and since migrating the code
-without a source unit's data would link with that data still claimed under another name, a unit with
-anything outside `.text` in the source is never confident, only a candidate. Likewise a run with any
-member matched below the confident tier. Output is `splits.txt` syntax, grouped by unit, with
-anything short of confident commented out and tagged with the reason:
+`--splits` carries over the unit each matched function or data symbol already belongs to in the
+source, proposing a boundary for every run of consecutive target functions or data symbols
+attributed to the same unit in the same section. A code run is only confident if the source unit's
+data was itself confidently proposed too — migrating the code alone would link with its data still
+claimed under another name. Likewise a run with any member matched below the confident tier. Output
+is `splits.txt` syntax, grouped by unit, with anything short of confident commented out and tagged
+with the reason:
 
 ```
 CPlayer:
