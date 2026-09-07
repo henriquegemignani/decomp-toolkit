@@ -6,6 +6,7 @@ use crate::{
         matching::{MatchResult, MatchTarget, MatchTier},
     },
     obj::{ObjSectionKind, ObjSymbolKind, SectionIndex},
+    util::split::default_section_align,
 };
 
 /// How much trust a proposed split boundary has earned.
@@ -226,8 +227,25 @@ fn group_runs(
 
         let run = &layout[i..j];
         let unit = unit.clone();
+        let same_section =
+            |k: usize| -> bool { layout.get(k).is_some_and(|it| it.section == section) };
+
         let start = run[0].start;
-        let end = run.last().unwrap().end;
+        // A data symbol's own byte range often stops short of the next one —
+        // trailing string padding, alignment gaps — so the true boundary is
+        // wherever the next known item starts (or the section's own end, for
+        // the last run in it), not the last member's raw end. Code runs are
+        // unaffected in practice, since functions sit back to back.
+        let end = if same_section(j) {
+            layout[j].start
+        } else {
+            target
+                .obj
+                .sections
+                .get(section)
+                .map(|s| (s.address + s.size) as u32)
+                .unwrap_or_else(|| run.last().unwrap().end)
+        };
 
         // Already split correctly: nothing to propose.
         if existing_split(target, section, start) == Some((start, end, unit.as_str())) {
@@ -235,8 +253,6 @@ fn group_runs(
             continue;
         }
 
-        let same_section =
-            |k: usize| -> bool { layout.get(k).is_some_and(|it| it.section == section) };
         let left_pinned = i == 0
             || !same_section(i - 1)
             || attribution.contains_key(&layout[i - 1].index)
@@ -269,6 +285,7 @@ fn group_runs(
             overlaps_split(target, section, start, end),
             all_confident,
             non_text_migrated(unit.as_str()),
+            aligned_boundary(target, section, start, end),
         );
 
         proposals.push(UnitProposal {
@@ -355,6 +372,7 @@ fn classify(
     overlaps_existing: bool,
     all_confident: bool,
     non_text_content_migrated: bool,
+    aligned_boundary: bool,
 ) -> (UnitTier, Vec<&'static str>) {
     let mut reasons = Vec::new();
     if run_len < expected {
@@ -378,8 +396,36 @@ fn classify(
     if !non_text_content_migrated {
         reasons.push("source unit has non-text content that wasn't migrated");
     }
+    if !aligned_boundary {
+        reasons.push("split boundary doesn't meet the section's required alignment");
+    }
     let tier = if reasons.is_empty() { UnitTier::Confident } else { UnitTier::Candidate };
     (tier, reasons)
+}
+
+/// Whether `start`/`end` both satisfy the alignment a split in this section
+/// actually needs to link without the linker inserting padding the original
+/// binary never had.
+///
+/// Mirrors [`crate::obj::ObjSplit::alignment`]: the section's own default
+/// (4 for code, 8 for most everything else) maxed with the largest `align`
+/// any symbol in the range declares. `default_section_align` alone isn't
+/// enough — a real migration produced a 448-byte-larger, hash-mismatched DOL
+/// from splits that were 4-byte aligned but not the 8 several `.rodata`/
+/// `.data` sections actually require.
+fn aligned_boundary(target: &MatchTarget, section: SectionIndex, start: u32, end: u32) -> bool {
+    let Some(s) = target.obj.sections.get(section) else { return false };
+    let default_align = default_section_align(s) as u32;
+    let align = target
+        .obj
+        .symbols
+        .for_section_range(section, start..end)
+        .filter(|&(_, sym)| sym.size_known && sym.size > 0)
+        .filter_map(|(_, sym)| sym.align)
+        .max()
+        .unwrap_or(default_align)
+        .max(default_align);
+    start % align == 0 && end % align == 0
 }
 
 fn has_split_at(target: &MatchTarget, section: SectionIndex, address: u32) -> bool {
@@ -408,7 +454,7 @@ mod tests {
     use super::*;
 
     fn baseline(run_len: usize, expected: usize) -> (UnitTier, Vec<&'static str>) {
-        classify(run_len, expected, true, true, true, false, true, true)
+        classify(run_len, expected, true, true, true, false, true, true, true)
     }
 
     #[test]
@@ -428,25 +474,25 @@ mod tests {
 
     #[test]
     fn an_unpinned_edge_is_a_candidate() {
-        let (tier, reasons) = classify(3, 3, false, true, true, false, true, true);
+        let (tier, reasons) = classify(3, 3, false, true, true, false, true, true, true);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["left edge borders an unmatched function"]);
 
-        let (tier, reasons) = classify(3, 3, true, false, true, false, true, true);
+        let (tier, reasons) = classify(3, 3, true, false, true, false, true, true, true);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["right edge borders an unmatched function"]);
     }
 
     #[test]
     fn a_reordered_run_is_a_candidate() {
-        let (tier, reasons) = classify(3, 3, true, true, false, false, true, true);
+        let (tier, reasons) = classify(3, 3, true, true, false, false, true, true, true);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["source functions are out of order"]);
     }
 
     #[test]
     fn overlap_with_an_existing_split_is_a_candidate() {
-        let (tier, reasons) = classify(3, 3, true, true, true, true, true, true);
+        let (tier, reasons) = classify(3, 3, true, true, true, true, true, true, true);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["overlaps an existing split"]);
     }
@@ -455,7 +501,7 @@ mod tests {
     fn a_non_confident_member_is_a_candidate() {
         // Attribution trusts Probable matches for grouping, but a run isn't
         // safe to write unreviewed unless every member earned Confident.
-        let (tier, reasons) = classify(3, 3, true, true, true, false, false, true);
+        let (tier, reasons) = classify(3, 3, true, true, true, false, false, true, true);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["contains a function matched below the confident tier"]);
     }
@@ -464,14 +510,23 @@ mod tests {
     fn a_source_unit_with_unmigrated_data_is_a_candidate() {
         // Migrating .text alone would leave the unit's data claimed by
         // whatever leftover object still covers it under another name.
-        let (tier, reasons) = classify(3, 3, true, true, true, false, true, false);
+        let (tier, reasons) = classify(3, 3, true, true, true, false, true, false, true);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["source unit has non-text content that wasn't migrated"]);
     }
 
     #[test]
+    fn an_unaligned_boundary_is_a_candidate() {
+        // The linker requires a split's boundary to meet its section's
+        // alignment; a data run's raw symbol extents often don't.
+        let (tier, reasons) = classify(3, 3, true, true, true, false, true, true, false);
+        assert_eq!(tier, UnitTier::Candidate);
+        assert_eq!(reasons, vec!["split boundary doesn't meet the section's required alignment"]);
+    }
+
+    #[test]
     fn multiple_problems_all_get_reported() {
-        let (tier, reasons) = classify(2, 3, false, false, true, false, true, true);
+        let (tier, reasons) = classify(2, 3, false, false, true, false, true, true, true);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec![
             "target is missing functions the source unit has",
