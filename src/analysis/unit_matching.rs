@@ -67,13 +67,22 @@ pub fn propose_units(
     let data_attribution = attribute_data(source, data_matches);
     let data_layout = data_layout(target);
     let source_data_counts = source_unit_counts(source, false);
-    let data_proposals =
-        group_runs(target, &data_layout, &data_attribution, &source_data_counts, |_| true);
+    // DataMatch has no weaker tier to fall back on, so there's nothing to feed
+    // bridge_gap's low-confidence check for data runs.
+    let data_proposals = group_runs(
+        target,
+        &data_layout,
+        &data_attribution,
+        &HashMap::new(),
+        &source_data_counts,
+        |_| true,
+    );
 
     let text_only = text_only_units(source);
     let migrated = non_text_migrated_units(source, target, &data_proposals);
 
     let function_attribution = attribute_functions(source, result);
+    let low_confidence_attribution = attribute_functions_candidates(source, result);
     let function_layout: Vec<Item> = target
         .layout()
         .iter()
@@ -92,6 +101,7 @@ pub fn propose_units(
         target,
         &function_layout,
         &function_attribution,
+        &low_confidence_attribution,
         &source_function_counts,
         |unit| text_only.contains(unit) || migrated.contains(unit),
     );
@@ -120,6 +130,18 @@ fn attribute_functions(
         }
     }
     attribution
+}
+
+/// Target functions matched only at [`MatchTier::Candidate`] — too weak for
+/// [`attribute_functions`] to attribute, but still real evidence of ownership
+/// when [`bridge_gap`] decides whether a gap is safe to cross.
+fn attribute_functions_candidates(source: &MatchTarget, result: &MatchResult) -> HashMap<u32, String> {
+    result
+        .matches
+        .iter()
+        .filter(|m| m.tier() == MatchTier::Candidate)
+        .filter_map(|m| Some((m.target, source.unit_of(m.source)?.to_string())))
+        .collect()
 }
 
 /// Attributes each target data symbol to a source unit via [`DataMatch`].
@@ -203,6 +225,7 @@ fn group_runs(
     target: &MatchTarget,
     layout: &[Item],
     attribution: &HashMap<u32, (String, MatchTier, u32)>,
+    low_confidence: &HashMap<u32, String>,
     source_unit_size: &HashMap<&str, usize>,
     non_text_migrated: impl Fn(&str) -> bool,
 ) -> Vec<UnitProposal> {
@@ -226,7 +249,7 @@ fn group_runs(
             while same_run(j) {
                 j += 1;
             }
-            match bridge_gap(target, layout, attribution, section, unit, j) {
+            match bridge_gap(target, layout, attribution, low_confidence, section, unit, j) {
                 Some(k) => {
                     bridged_gap_bytes += layout[k].start - layout[j].start;
                     j = k;
@@ -318,48 +341,56 @@ fn group_runs(
     proposals
 }
 
-/// Bounds how much *unattributed* content [`bridge_gap`] will assume is a
-/// matching gap rather than a real function boundary. Large enough to cover
-/// a handful of tiny unmatched helper functions, small enough to not
-/// plausibly hide a whole unrelated function.
+/// Bounds how much genuinely evidence-free content [`bridge_gap`] will
+/// assume is a matching gap rather than a real function boundary. Large
+/// enough to cover a handful of tiny unmatched helper functions, small
+/// enough to not plausibly hide a whole unrelated function.
 const MAX_BRIDGE_GAP_BYTES: u32 = 512;
 
 /// A run breaks the moment [`group_runs`]'s `same_run` hits a function the
-/// matcher didn't attribute to `unit` at all — often just a tiny function
-/// (an inline accessor, a trivial dtor) without enough signal for Tier 1/2
-/// matching to pin down individually. When the run resumes with the *same*
-/// unit right after a small enough run of those unattributed items, bridge
-/// across it instead of ending the run there — otherwise one real function
-/// boundary gets reported as two disjoint, riskier proposals instead of one
-/// verifiable one.
+/// matcher didn't attribute to `unit` at all. Two different things produce
+/// that: a function with no useful signal at any tier, or one only matched
+/// at [`MatchTier::Candidate`] — too weak to attribute, but still real
+/// evidence, checked here against `low_confidence`. When the run resumes
+/// with the *same* unit, bridge across the gap instead of ending the run
+/// there — otherwise one real function boundary gets reported as two
+/// disjoint, riskier proposals instead of one verifiable one.
 ///
-/// Refuses to bridge past a section boundary, a different unit's function,
-/// or an address some other unit's split has already claimed — any of
-/// those is real evidence the gap isn't this unit's, not just a matching
-/// gap. Returns the index the run should resume at, or `None` if the gap
-/// isn't safely bridgeable.
+/// Refuses to bridge past a section boundary, an address some other unit's
+/// split has already claimed, or a function — at any tier, including
+/// Candidate — attributed to a *different* unit: real evidence the gap
+/// isn't this unit's, not just a matching gap. Content with no evidence
+/// either way is still capped at [`MAX_BRIDGE_GAP_BYTES`], since absence of
+/// evidence isn't evidence of this unit. Returns the index the run should
+/// resume at, or `None` if the gap isn't safely bridgeable.
 fn bridge_gap(
     target: &MatchTarget,
     layout: &[Item],
     attribution: &HashMap<u32, (String, MatchTier, u32)>,
+    low_confidence: &HashMap<u32, String>,
     section: SectionIndex,
     unit: &str,
     from: usize,
 ) -> Option<usize> {
-    let gap_start = layout.get(from)?.start;
     let mut k = from;
+    let mut blind_bytes = 0u32;
     loop {
         let it = layout.get(k)?;
         if it.section != section {
             return None;
         }
-        match attribution.get(&it.index) {
-            Some((u, _, _)) if u == unit => {
-                return (it.start - gap_start <= MAX_BRIDGE_GAP_BYTES).then_some(k);
-            }
+        if let Some((u, _, _)) = attribution.get(&it.index) {
+            return (u == unit).then_some(k);
+        }
+        match low_confidence.get(&it.index) {
+            Some(u) if u == unit => k += 1,
             Some(_) => return None,
             None => {
                 if overlaps_split(target, section, it.start, it.end) {
+                    return None;
+                }
+                blind_bytes += it.end - it.start;
+                if blind_bytes > MAX_BRIDGE_GAP_BYTES {
                     return None;
                 }
                 k += 1;
