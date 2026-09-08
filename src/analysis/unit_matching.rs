@@ -221,8 +221,18 @@ fn group_runs(
             })
         };
         let mut j = i + 1;
-        while same_run(j) {
-            j += 1;
+        let mut bridged_gap_bytes = 0u32;
+        loop {
+            while same_run(j) {
+                j += 1;
+            }
+            match bridge_gap(target, layout, attribution, section, unit, j) {
+                Some(k) => {
+                    bridged_gap_bytes += layout[k].start - layout[j].start;
+                    j = k;
+                }
+                None => break,
+            }
         }
 
         let run = &layout[i..j];
@@ -271,9 +281,14 @@ fn group_runs(
             .collect();
         let monotonic = source_positions.windows(2).all(|w| w[0] < w[1]);
 
-        let all_confident = run.iter().all(|it| {
-            attribution.get(&it.index).is_some_and(|(_, t, _)| *t == MatchTier::Confident)
-        });
+        // Bridged gap members (below) are deliberately excluded here: they
+        // were never matched at all, which classify() reports as its own,
+        // more specific reason rather than folding it into "some member
+        // matched below Confident."
+        let all_confident = run
+            .iter()
+            .filter_map(|it| attribution.get(&it.index))
+            .all(|(_, t, _)| *t == MatchTier::Confident);
 
         let expected = source_unit_size.get(unit.as_str()).copied().unwrap_or(0);
         let (tier, reasons) = classify(
@@ -286,6 +301,7 @@ fn group_runs(
             all_confident,
             non_text_migrated(unit.as_str()),
             aligned_boundary(target, section, start, end),
+            bridged_gap_bytes,
         );
 
         proposals.push(UnitProposal {
@@ -300,6 +316,56 @@ fn group_runs(
         i = j;
     }
     proposals
+}
+
+/// Bounds how much *unattributed* content [`bridge_gap`] will assume is a
+/// matching gap rather than a real function boundary. Large enough to cover
+/// a handful of tiny unmatched helper functions, small enough to not
+/// plausibly hide a whole unrelated function.
+const MAX_BRIDGE_GAP_BYTES: u32 = 512;
+
+/// A run breaks the moment [`group_runs`]'s `same_run` hits a function the
+/// matcher didn't attribute to `unit` at all — often just a tiny function
+/// (an inline accessor, a trivial dtor) without enough signal for Tier 1/2
+/// matching to pin down individually. When the run resumes with the *same*
+/// unit right after a small enough run of those unattributed items, bridge
+/// across it instead of ending the run there — otherwise one real function
+/// boundary gets reported as two disjoint, riskier proposals instead of one
+/// verifiable one.
+///
+/// Refuses to bridge past a section boundary, a different unit's function,
+/// or an address some other unit's split has already claimed — any of
+/// those is real evidence the gap isn't this unit's, not just a matching
+/// gap. Returns the index the run should resume at, or `None` if the gap
+/// isn't safely bridgeable.
+fn bridge_gap(
+    target: &MatchTarget,
+    layout: &[Item],
+    attribution: &HashMap<u32, (String, MatchTier, u32)>,
+    section: SectionIndex,
+    unit: &str,
+    from: usize,
+) -> Option<usize> {
+    let gap_start = layout.get(from)?.start;
+    let mut k = from;
+    loop {
+        let it = layout.get(k)?;
+        if it.section != section {
+            return None;
+        }
+        match attribution.get(&it.index) {
+            Some((u, _, _)) if u == unit => {
+                return (it.start - gap_start <= MAX_BRIDGE_GAP_BYTES).then_some(k);
+            }
+            Some(_) => return None,
+            None => {
+                if overlaps_split(target, section, it.start, it.end) {
+                    return None;
+                }
+                k += 1;
+            }
+        }
+    }
 }
 
 /// Source units whose every declared split lives in a code section.
@@ -373,6 +439,7 @@ fn classify(
     all_confident: bool,
     non_text_content_migrated: bool,
     aligned_boundary: bool,
+    bridged_gap_bytes: u32,
 ) -> (UnitTier, Vec<&'static str>) {
     let mut reasons = Vec::new();
     if run_len < expected {
@@ -398,6 +465,9 @@ fn classify(
     }
     if !aligned_boundary {
         reasons.push("split boundary doesn't meet the section's required alignment");
+    }
+    if bridged_gap_bytes > 0 {
+        reasons.push("bridges unmatched functions between two runs of the same unit");
     }
     let tier = if reasons.is_empty() { UnitTier::Confident } else { UnitTier::Candidate };
     (tier, reasons)
@@ -454,7 +524,7 @@ mod tests {
     use super::*;
 
     fn baseline(run_len: usize, expected: usize) -> (UnitTier, Vec<&'static str>) {
-        classify(run_len, expected, true, true, true, false, true, true, true)
+        classify(run_len, expected, true, true, true, false, true, true, true, 0)
     }
 
     #[test]
@@ -474,25 +544,25 @@ mod tests {
 
     #[test]
     fn an_unpinned_edge_is_a_candidate() {
-        let (tier, reasons) = classify(3, 3, false, true, true, false, true, true, true);
+        let (tier, reasons) = classify(3, 3, false, true, true, false, true, true, true, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["left edge borders an unmatched function"]);
 
-        let (tier, reasons) = classify(3, 3, true, false, true, false, true, true, true);
+        let (tier, reasons) = classify(3, 3, true, false, true, false, true, true, true, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["right edge borders an unmatched function"]);
     }
 
     #[test]
     fn a_reordered_run_is_a_candidate() {
-        let (tier, reasons) = classify(3, 3, true, true, false, false, true, true, true);
+        let (tier, reasons) = classify(3, 3, true, true, false, false, true, true, true, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["source functions are out of order"]);
     }
 
     #[test]
     fn overlap_with_an_existing_split_is_a_candidate() {
-        let (tier, reasons) = classify(3, 3, true, true, true, true, true, true, true);
+        let (tier, reasons) = classify(3, 3, true, true, true, true, true, true, true, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["overlaps an existing split"]);
     }
@@ -501,7 +571,7 @@ mod tests {
     fn a_non_confident_member_is_a_candidate() {
         // Attribution trusts Probable matches for grouping, but a run isn't
         // safe to write unreviewed unless every member earned Confident.
-        let (tier, reasons) = classify(3, 3, true, true, true, false, false, true, true);
+        let (tier, reasons) = classify(3, 3, true, true, true, false, false, true, true, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["contains a function matched below the confident tier"]);
     }
@@ -510,7 +580,7 @@ mod tests {
     fn a_source_unit_with_unmigrated_data_is_a_candidate() {
         // Migrating .text alone would leave the unit's data claimed by
         // whatever leftover object still covers it under another name.
-        let (tier, reasons) = classify(3, 3, true, true, true, false, true, false, true);
+        let (tier, reasons) = classify(3, 3, true, true, true, false, true, false, true, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["source unit has non-text content that wasn't migrated"]);
     }
@@ -519,14 +589,23 @@ mod tests {
     fn an_unaligned_boundary_is_a_candidate() {
         // The linker requires a split's boundary to meet its section's
         // alignment; a data run's raw symbol extents often don't.
-        let (tier, reasons) = classify(3, 3, true, true, true, false, true, true, false);
+        let (tier, reasons) = classify(3, 3, true, true, true, false, true, true, false, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec!["split boundary doesn't meet the section's required alignment"]);
     }
 
     #[test]
+    fn a_bridged_gap_is_a_candidate() {
+        // Bridging a gap of unmatched functions is a real bet, not proof --
+        // it must never come back Confident, no matter how small the gap.
+        let (tier, reasons) = classify(3, 3, true, true, true, false, true, true, true, 204);
+        assert_eq!(tier, UnitTier::Candidate);
+        assert_eq!(reasons, vec!["bridges unmatched functions between two runs of the same unit"]);
+    }
+
+    #[test]
     fn multiple_problems_all_get_reported() {
-        let (tier, reasons) = classify(2, 3, false, false, true, false, true, true, true);
+        let (tier, reasons) = classify(2, 3, false, false, true, false, true, true, true, 0);
         assert_eq!(tier, UnitTier::Candidate);
         assert_eq!(reasons, vec![
             "target is missing functions the source unit has",

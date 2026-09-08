@@ -1236,8 +1236,12 @@ fn resolve_link_order(obj: &ObjInfo) -> Result<Vec<ObjUnit>> {
             log::debug!("Skipping split {:?} (next: {:?})", skipped, iter.peek());
         }
         while let (Some((a_addr, a)), Some(&(b_addr, b))) = (iter.next(), iter.peek()) {
-            if !a.common && b.common {
-                // This marks the beginning of the common BSS section.
+            // Common BSS (CodeWarrior/mwld's analogue of an ELF COMMON symbol)
+            // is packed by the linker's own alignment/size rules, not by
+            // link/declaration order, so address-adjacency touching a common
+            // split isn't evidence of an ordering requirement. Non-common BSS
+            // is still ordered like any other section.
+            if a.common || b.common {
                 continue;
             }
 
