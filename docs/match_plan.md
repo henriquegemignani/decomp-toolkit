@@ -182,8 +182,203 @@ Roughly in dependency order:
    disagreement detection, tier promotion and demotion.
 6. **Source-independence warning.** Cheap check that two sources aren't near-clones.
 
+## Task 3: splits migration — first real run and what it taught
+
+`dtk match --splits` shipped (`src/analysis/unit_matching.rs`) and was run for real on 2026-09-06,
+NTSC `GM8E01_00` → PAL `GM8P01_00`, in `C:\Users\henri\programming\decomp\prime`. Outcome:
+
+| Stage | Units |
+|---|---|
+| Confident split proposals | 237 |
+| Reverted: source unit has non-`.text` content we didn't migrate | −169 |
+| Reverted: depends on unmatched code (undefined symbols at link) | −9 |
+| **Linked for PAL, `ninja` clean** | **58** |
+| Of which byte-identical per `report.json` | 260 functions, SDK 98%, Kyoto 81% |
+
+Also applied: 6,047 confident function renames (3 skipped on genuine collisions), and `scope:local`
+on 11 duplicate template-instantiation names. Everything in the prime repo is **uncommitted** as of
+writing (`splits.txt`, `symbols.txt`, `configure.py` for GM8P01_00). Full detail in
+[match_learnings.md](match_learnings.md#findings-from-the-first-real-migration).
+
+The tasks below are ordered by what recovers the most units per unit of effort, and each is
+independent of the multi-source work above.
+
+### Task 3a: tighten the Confident tier (stop the bleeding) — **done**
+
+Implemented and validated against the same PAL migration on 2026-09-07.
+
+- ~~Require **every** member function of a run to be a Confident match~~. Done: `propose_units`
+  still trusts Probable for attribution (grouping), but `classify()` now takes `all_confident` and
+  adds `"contains a function matched below the confident tier"` when any member falls short.
+- ~~Require the **source unit to be `.text`-only**~~. Done: `text_only_units()` scans every section
+  of the source `ObjInfo` and flags any unit with a split outside `ObjSectionKind::Code`; `classify()`
+  adds `"source unit has non-text content that wasn't migrated"`. Superseded once 3c lands.
+- ~~Propagate **symbol scope** through renames~~. Done, and differently than sketched: rather than
+  detecting duplicate names and picking one to keep global, `MatchTarget::is_local()` copies the
+  *source* symbol's own scope onto each match directly — correct per-instance, since NTSC and PAL
+  don't agree with each other on which specific copy of a duplicate is the local one, so there's
+  nothing to usefully detect. `--renames`/`--candidates` append a trailing `local` word;
+  `Renames::parse` reads it; `apply_renames` calls a new `ensure_scope_local()` that adds
+  `scope:local` to the target line's attributes unless it already declares a scope.
+- **Found during validation, not in the original plan**: the collision guard in `apply_renames`
+  rejected exactly the renames the `local` marker exists for — a name already held by an *existing*
+  symbol is precisely the legitimate-duplicate case, not a real collision. Fixed: a `local` rename
+  skips the taken-name check entirely; only a global rename still collides. Without this fix, PAL's
+  three previously-collision-skipped `AlarmHandler`/`OnReset` renames stayed skipped even with the
+  scope marker in hand.
+
+Re-running against PAL's already-migrated state confirmed the fix live: the three renames applied
+(all four `AlarmHandler` and four `OnReset` copies across PAL now carry `scope:local`), and
+`--splits` correctly dropped from 237 to 8 new confident proposals against the same source/target,
+with the 179 previously-reverted units now showing their real reasons instead of silence.
+
+### Task 3b: verify by compiling, never by asserting — medium, highest workflow value, **implemented prime-side**
+
+Built as `tools/split_confidence_loop.py` in the prime repo, not in dtk (correctly — see "needs
+nothing from the matcher itself" below), and matches the loop sketched here closely: stage every
+proposal (confident and candidate alike, not just confident), compile-verify against
+`report.json`'s per-section `fuzzy_match_percent` at 100%, real-link check, then gate on the full-DOL
+hash check before anything is considered real — reverting piecemeal (dropping the specific unit a
+build failure names, or the nearest staged candidate by address when it doesn't) rather than
+all-or-nothing. Extended well past the original sketch: a link-order pre-check that mirrors
+`resolve_link_order` in Python to catch a doomed batch before ever running a real build, direct
+byte-comparison against a linked ELF for the "confident but blocked by an unclaimed neighbor" case
+(see [match_learnings.md](match_learnings.md#a-confidently-matched-section-can-still-fail-comparison-because-of-its-neighbor-not-its-own-content)),
+and a cheap NTSC-declaration-order neighbor-consistency check that catches a wrong section match
+before ever staging it, not just after a build fails.
+
+Result as of 2026-09-08: PAL units present grew from 247 to 282 of 814 (34.6%) across the session,
+each one confirmed against the real hash check, not just a clean link — see
+[match_learnings.md](match_learnings.md#findings-from-continued-pal-migration-work) for what broke
+finding that number and how each was fixed.
+
+Original plan text, for reference — still the shape of what the script above actually does:
+
+Marking `MatchingFor(<version>)` from a function match alone is the wrong process; it asserts a
+byte-match nobody checked. The loop should be:
+
+1. Apply every proposable split with **no** `MatchingFor` change.
+2. Compile-only build; read `build/<ver>/report.json` (per-unit match %).
+3. Mark `MatchingFor` only for units at 100%.
+4. Before linking, per candidate unit read the compiled `.o`'s undefined externals (dtk already
+   parses ELF) and check each exists in the target `symbols.txt`; rename from a matched counterpart
+   where possible, defer the unit otherwise. Catches `CTreeUtils::GetTransitionTree` before the
+   linker does.
+
+Turns four manual build-fix rounds into one pass and makes "converted" a measured number. Needs
+nothing from the matcher itself — still the highest-value remaining task.
+
+**Revised after the 2026-09-07 hash-checked migration below: step 3's "100%" gate is necessary but
+not sufficient.** A real full-DOL hash check (not `--non-matching`, which skips it entirely) failed
+on a build where linking succeeded and `report.json` showed every enabled unit as `complete: true`.
+Two failure classes neither the linker nor `report.json`'s top-level `complete` flag catch:
+
+- **A per-object `total_code`/`total_data` match doesn't cover the whole file.** A unit whose only
+  confident match was its data (never its code) still gets *all* of its source compiled once
+  `MatchingFor` is set for the whole path — including functions no split ever reserved space for.
+  Nothing was multiply-defined (nothing else claimed that space) or undefined (nothing referenced
+  it) — the linker just silently appended the extra bytes, growing the DOL and shifting every
+  address after it. Step 3 needs a per-*file* check, not per-split: only mark `MatchingFor` when
+  every section the source file will actually emit — text included, even if no `--splits` proposal
+  covers it — is accounted for.
+- **`report.json`'s `complete` flag isn't the same as byte-identical.** A section can be "complete"
+  (every expected symbol accounted for) while its actual bytes differ — the per-section
+  `fuzzy_match_percent` is the field that catches this, and step 3 needs to gate on *that*, at 100%,
+  not on the coarser `complete` boolean. Seen for real: a string-literal data pool matched
+  positionally (same function, same reference) at 95.38% — the reference was right, but PAL's actual
+  string content differs from NTSC's (plausibly localization), which is legitimate game content, not
+  a matcher error. Position-confidence about *which* data a function references is not the same
+  claim as byte-confidence about *what's in* that data, and only the compile-and-diff step can tell
+  them apart.
+
+Both went undetected by every check available short of an actual hash-checked link — `--validate`
+never touches the linker, and `--non-matching` explicitly skips the checksum gate that would have
+caught them immediately. See [match_learnings.md](match_learnings.md#the-hash-check-is-the-only-real-oracle-linking-clean-is-not-enough).
+
+### Task 3c: migrate data sections with the code — large, recovers the most units — **done**
+
+Implemented and validated (read-only) against PAL on 2026-09-07, `src/analysis/data_matching.rs` +
+`src/analysis/unit_matching.rs`.
+
+- **Data symbol matching.** `match_data()` aligns, for every `MatchTier::Confident` function pair,
+  their `data_refs()` sequences — but only positionally and all-or-nothing (same length, each
+  position agreeing on relocation kind and addend), not LCS-style like call sites: there's no
+  pre-existing partial map of data symbols to anchor on the way matched callees anchor a call
+  sequence. A `(source, target)` pair only survives if every position it appeared in agreed, in both
+  directions — the same collapse-on-disagreement rule `anchor_by_string` already used, reused via
+  `merge_proposal`. Function-pointer data refs (vtable slots) are excluded; they already have their
+  own match, or don't, from `match_functions`.
+- **Matched data symbols go to `--renames`** too, gated the same way function renames are (source
+  named, target not). Validated against the real PAL run: **2,360 new confident data renames**,
+  where the previous run (function matching only) found none — real names recovered include struct
+  members, static tables (`kMissileCosts`, `kComboAmmoPeriods`), vtables (`__vt__17CColorInstruction`),
+  and string-pool labels, several correctly carrying `local`.
+- **`propose_units` now proposes non-code runs too.** A data "layout" (every sized `Object` symbol in
+  a non-code target section) is grouped the same way the function layout is, via a `group_runs()`
+  the two now share. A code run's "non-text content" objection is dropped once a Confident data
+  proposal covers *every* non-code section the source unit owns (`non_text_migrated_units()`) —
+  `text_only_units()` from 3a still short-circuits the common case of a unit with nothing to migrate.
+  Validated: the same PAL match now proposes **141 confident splits** (51 `.text`, 31 `.data`,
+  30 `.sdata2`, 13 `.rodata`, 7 `.sbss`, 6 `.bss`, 3 `.sdata`) instead of function-only splits, with
+  units like `Collision/CMRay.cpp` correctly getting both a `.text` and a `.sdata2` proposal together.
+- **`.ctors`/`.dtors`/`extabindex`**: no new dtk code. As noted below, `split_ctors_dtors` already
+  adopts a pointed-to function's unit once that function has a `.text` split — this falls out of the
+  existing single-binary split analysis once 3c's function+data splits are applied and the module is
+  re-analyzed, not something `dtk match` itself needs to compute.
+
+**Applied for real on 2026-09-07**, from a freshly-reverted, freshly-pulled PAL (no prior migration
+state): NTSC → PAL end to end — `dtk match`, `dtk symbols rename`, `dtk splits merge`, then
+`MatchingFor("GM8P01_00")` added to every newly-split unit that was already `MatchingFor` on NTSC
+(137 of 155; the other 18 aren't matching on NTSC either, so there's no basis to expect PAL to link
+from source for them). First `ninja` run caught a real dtk bug — see the alignment finding in
+[match_learnings.md](match_learnings.md) — fixed and re-run clean. After excluding 32 units that
+still failed to link (28 multiply-defined against their own leftover object, 4 undefined-symbol
+dependencies on not-yet-matching code — both the exact failure classes task 3b is meant to catch
+automatically), **105 units link for PAL**, up from 58 in the first migration. `configure.py`,
+`symbols.txt`, `splits.txt` are updated and uncommitted in the prime repo.
+
+Superseded by task 3b's now-implemented compile-verify loop: 105 was a link-only, `--non-matching`
+count, since revised as "necessary but not sufficient" below. As of 2026-09-08, **282 of 814 PAL
+units are present**, each confirmed against the real full-DOL hash check rather than a clean link —
+see task 3b above.
+
+### Task 3d: put the apply steps into dtk — small, half done
+
+Two throwaway Python scripts did the first migration's merging and `configure.py` editing. They
+shouldn't exist.
+- ~~`dtk splits merge`~~. **Done**: `src/util/split_merge.rs` + `dtk splits merge <splits.txt>
+  <proposal>`, mirroring `dtk symbols rename`. Inserts confident units in address order, skips a
+  name already present (reported, not overwritten), preserves the `Sections:` header verbatim and
+  the file's own CRLF/LF choice. Validated on PAL: also fixed drift in the original file where two
+  units had ended up out of address order from the earlier hand-rolled script's edits.
+- Project side (`configure.py`'s `MatchingFor` tuples): **not done**. Depends on 3b existing first —
+  there's no point automating "add a version to `MatchingFor`" while the decision of *which* units
+  qualify is still manual.
+
+### Small items
+
+- Document that in-progress versions need `configure.py --non-matching`; the default target includes
+  a full-ROM checksum that can only pass at 100%.
+- PAL's five `Runtime/*` units are capitalized differently from `configure.py`'s `runtime/*` objects
+  and silently fall back to original bytes ("Missing configuration for Runtime/…"). Pre-existing,
+  unrelated to the migration.
+- ~~`unit_matching.rs` docs say ".text-only" but it actually proposes any code section~~. **Done** as
+  part of 3c's rewrite: code runs are just "code", data runs are their own thing, and the wording no
+  longer implies `.text` specifically.
+
 ## Open questions
 
+- **`.ctors`/function unit-attribution path-prefix bug.** `resolve_link_order`'s ctors/dtors
+  consistency check attributed `runtime/__init_cpp_exceptions.cpp`'s `.ctors` entry to a unit missing
+  its directory prefix while the function kept it, treating one real unit as two. Not yet
+  root-caused to a specific line or fixed; see
+  [match_learnings.md](match_learnings.md#the-ctorsfunction-unit-attribution-check-has-a-path-prefix-bug-open).
+- **BSS's residual link-order fragility.** Even after distinguishing common from regular BSS
+  (task 3b work, 2026-09-08), a smaller cyclic component can still occur among regular BSS with no
+  individually-wrong candidate found — current best explanation is alignment/size-driven packing
+  that isn't strictly monotonic with declaration order, just usually close enough. Treating BSS edges
+  as soft/tie-breaking rather than a hard toposort constraint is the likely direction; not attempted.
+  See [match_learnings.md](match_learnings.md#bss-address-adjacency-is-not-a-reliable-link-order-signal-but-the-reason-is-narrower-than-no-file-content).
 - **Exposing `use_layout`.** `MatchOptions::use_layout` has no CLI flag. Link-order inference
   assumes a shared translation-unit layout, which holds across revisions of one game and not across
   different games. It needs a flag before the cross-game work, and the default should probably
