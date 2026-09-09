@@ -54,6 +54,10 @@ impl MatchTarget {
         self.is_local_at(self.graph.node(node).symbol)
     }
 
+    pub fn is_weak(&self, node: NodeIndex) -> bool {
+        self.obj.symbols[self.graph.node(node).symbol].flags.is_weak()
+    }
+
     /// The split unit this function currently belongs to, if its section has
     /// a split covering its address.
     pub fn unit_of(&self, node: NodeIndex) -> Option<&str> {

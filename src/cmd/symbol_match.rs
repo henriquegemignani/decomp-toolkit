@@ -12,6 +12,7 @@ use typed_path::{Utf8NativePath, Utf8NativePathBuf};
 
 use crate::{
     analysis::{
+        coverage::build_report as build_coverage_report,
         data_matching::{DataMatch, match_data},
         matching::{MatchOptions, MatchResult, MatchTarget, MatchTier, match_functions},
         tracker::Tracker,
@@ -52,6 +53,9 @@ pub struct Args {
     /// in splits.txt syntax. Confident entries are ready to paste in;
     /// candidates are commented out with the reason they weren't confident
     splits: Option<Utf8NativePathBuf>,
+    #[argp(option, from_str_fn(native_path))]
+    /// write evidence for conservative partial translation-unit coverage
+    coverage: Option<Utf8NativePathBuf>,
     #[argp(option, short = 'c')]
     /// minimum confidence for a match to be reported (default 0.5)
     min_confidence: Option<f32>,
@@ -187,6 +191,13 @@ pub fn run(args: Args) -> Result<()> {
     if let Some(path) = &args.splits {
         let proposals = propose_units(&source, &target, &result, &data_matches);
         write_unit_proposals(path, &target, &proposals)?;
+    }
+    if let Some(path) = &args.coverage {
+        let coverage = build_coverage_report(&source, &target, args.validate);
+        let mut file = buf_writer(path)?;
+        serde_json::to_writer_pretty(&mut file, &coverage)?;
+        file.flush()?;
+        info!("Wrote coverage evidence to {}", path);
     }
     Ok(())
 }

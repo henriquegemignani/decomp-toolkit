@@ -81,33 +81,41 @@ pub fn fingerprint_all(obj: &ObjInfo, graph: &CallGraph) -> Vec<Fingerprint> {
 pub fn fingerprint(obj: &ObjInfo, node: &FunctionNode) -> Fingerprint {
     let mut exact = Xxh3::new();
     let mut opcodes = Xxh3::new();
-    let mut instruction_count = 0;
-
-    if let Some(section) = obj.sections.get(node.section) {
-        let start = (node.address as u64 - section.address) as usize;
-        let end = (start + node.size as usize).min(section.data.len());
-        for (index, chunk) in section.data[start.min(end)..end].chunks_exact(4).enumerate() {
-            let address = node.address + (index * 4) as u32;
-            let mut code = u32::from_be_bytes(chunk.try_into().unwrap());
-            // Clear the bits the linker patched in, so the hash describes the
-            // instruction rather than where its target happened to land.
-            if let Some(reloc) = section.relocations.at(address) {
-                code &= !reloc.kind.value_mask();
-            }
-            exact.update(&code.to_be_bytes());
-            opcodes.update(&(Ins::new(code).op as u32).to_be_bytes());
-            instruction_count += 1;
-        }
+    let body = normalized_body(obj, node);
+    for chunk in body.chunks_exact(4) {
+        let code = u32::from_be_bytes(chunk.try_into().unwrap());
+        exact.update(chunk);
+        opcodes.update(&(Ins::new(code).op as u32).to_be_bytes());
     }
 
     Fingerprint {
         exact_hash: exact.digest(),
         opcode_hash: opcodes.digest(),
-        instruction_count,
+        instruction_count: body.len() as u32 / 4,
         call_count: node.calls().count() as u32,
         data_ref_count: node.data_refs().count() as u32,
         strings: referenced_strings(obj, node),
     }
+}
+
+/// A function's instruction bytes with every relocation-owned field cleared.
+///
+/// This is also used to confirm equality after a hash lookup. Returning the
+/// bytes keeps hash collisions from becoming coverage evidence.
+pub fn normalized_body(obj: &ObjInfo, node: &FunctionNode) -> Vec<u8> {
+    let Some(section) = obj.sections.get(node.section) else { return Vec::new() };
+    let start = (node.address as u64 - section.address) as usize;
+    let end = (start + node.size as usize).min(section.data.len());
+    let mut body = Vec::with_capacity(end.saturating_sub(start));
+    for (index, chunk) in section.data[start.min(end)..end].chunks_exact(4).enumerate() {
+        let address = node.address + (index * 4) as u32;
+        let mut code = u32::from_be_bytes(chunk.try_into().unwrap());
+        if let Some(reloc) = section.relocations.at(address) {
+            code &= !reloc.kind.value_mask();
+        }
+        body.extend_from_slice(&code.to_be_bytes());
+    }
+    body
 }
 
 /// Collects string literals reachable through the function's data references.
