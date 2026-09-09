@@ -130,7 +130,13 @@ fn array_type_string(
         );
         match dim.size {
             None => out.suffix.insert_str(0, "[]"),
-            Some(size) => out.suffix = format!("[{}]{}", size, out.suffix),
+            Some(size) => {
+                if info.producer == Producer::MWCC {
+                    out.suffix = format!("[{}]{}", size, out.suffix);
+                } else {
+                    out.suffix = format!("{}[{}]", out.suffix, size);
+                }
+            }
         };
     }
     Ok(out)
@@ -670,7 +676,7 @@ pub fn subroutine_def_string(
             writeln!(
                 out,
                 "{};",
-                &indent_all_by(4, &ud_type_def(info, typedefs, inner_type, false)?)
+                indent_all_by(4, &ud_type_def(info, typedefs, inner_type, false)?)
             )?;
         }
     }
@@ -678,7 +684,7 @@ pub fn subroutine_def_string(
     if !t.typedefs.is_empty() {
         writeln!(out, "\n    // Typedefs")?;
         for typedef in &t.typedefs {
-            writeln!(out, "{}", &indent_all_by(4, &typedef_string(info, typedefs, typedef)?))?;
+            writeln!(out, "{}", indent_all_by(4, &typedef_string(info, typedefs, typedef)?))?;
         }
     }
 
@@ -781,7 +787,7 @@ fn subroutine_block_string(
             writeln!(
                 out,
                 "{};",
-                &indent_all_by(4, &ud_type_def(info, typedefs, inner_type, false)?)
+                indent_all_by(4, &ud_type_def(info, typedefs, inner_type, false)?)
             )?;
         }
     }
@@ -789,7 +795,7 @@ fn subroutine_block_string(
     if !block.typedefs.is_empty() {
         writeln!(out, "\n    // Typedefs")?;
         for typedef in &block.typedefs {
-            writeln!(out, "{}", &indent_all_by(4, &typedef_string(info, typedefs, typedef)?))?;
+            writeln!(out, "{}", indent_all_by(4, &typedef_string(info, typedefs, typedef)?))?;
         }
     }
 
@@ -967,7 +973,7 @@ pub fn structure_def_string(
             writeln!(
                 out,
                 "{};",
-                &indent_all_by(4, &ud_type_def(info, typedefs, inner_type, false)?)
+                indent_all_by(4, &ud_type_def(info, typedefs, inner_type, false)?)
             )?;
         }
     }
@@ -975,7 +981,7 @@ pub fn structure_def_string(
     if !t.typedefs.is_empty() {
         writeln!(out, "\n    // Typedefs")?;
         for typedef in &t.typedefs {
-            writeln!(out, "{}", &indent_all_by(4, &typedef_string(info, typedefs, typedef)?))?;
+            writeln!(out, "{}", indent_all_by(4, &typedef_string(info, typedefs, typedef)?))?;
         }
     }
 
