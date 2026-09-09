@@ -193,7 +193,7 @@ pub fn run(args: Args) -> Result<()> {
         write_unit_proposals(path, &target, &proposals)?;
     }
     if let Some(path) = &args.coverage {
-        let coverage = build_coverage_report(&source, &target, args.validate);
+        let coverage = build_coverage_report(&source, &target, &result, args.validate);
         let mut file = buf_writer(path)?;
         serde_json::to_writer_pretty(&mut file, &coverage)?;
         file.flush()?;
