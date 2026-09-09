@@ -1,5 +1,49 @@
 # Symbol matching: learnings
 
+## Validation correction — 2026-09-09
+
+These are historical observations and hypotheses. Reproduce them before treating
+them as current guarantees. The workflow scripts now live in the external
+`dtk-version-matching` repository; its `docs/validation_audit.md` records the audit
+and its README documents the replacement workflow.
+
+**The retail hash is a source-code oracle only if the tested compiled objects are
+actually linked.** The old split loop did not enable its proposed files in
+`configure.py`. `tools/project.py::add_unit` therefore selected extracted original
+objects for those files. Comparing their bytes in `main.elf` with the original DOL
+was circular. This invalidates the claimed direct-byte-confirmed promotions below
+as evidence of candidate source correctness. The old ELF fallback is now disabled
+unless explicit source-link provenance is supplied.
+
+`metadata.complete` comes from `Object.completed`, not a semantic completeness or
+byte-equality check. Objdiff's function and section scores are useful comparison
+evidence but do not cover arbitrary additional compiler output; the default
+relocation policy can also ignore differences. A missing section score, an empty
+section list, or an adjacent auto-named symbol is not proof of a match.
+
+The corrected workflow has two gates:
+
+- `discover_splits.py` retains partial code splits when compiling them increases
+  matched code without regressing an existing unit, while the retail build checks
+  split integrity. Fragmented proposals are tested as broader code ranges instead
+  of throwing away all but one small cluster. It can extend existing partial splits.
+- `verify_source_units.py` actually enables candidate compiled objects, verifies
+  they occur in the linker dependency graph, requires the retail checksum and raw
+  DOL equality, and only then records generated source-link settings.
+
+The initial PAL report was 6.5565% matched code overall (6.6154% DOL-only), despite
+the much larger split-presence counts below. The first 100-proposal discovery pass
+reached 16.5924% overall, with the same 3,908,836-byte denominator. These are
+objdiff matching percentages, not whole-source linkage percentages.
+
+Other corrections: `--dtk` must reach both matching and configure/Ninja, so a
+downloaded tool cannot silently replace the analysis build. One failed trial does
+not permanently disprove a unit, and address-proximity blame after a failed hash
+is a heuristic rather than independent proof. An SCC demonstrates inconsistent
+graph constraints; it does not itself prove every boundary or the graph model is
+correct. Speculative explanations below, including BSS packing and the alleged
+`.ctors` path-prefix bug, remain hypotheses unless independently reproduced.
+
 Working notes from building and tuning [`dtk match`](../README.md#match). Where `match_plan.md`
 (if present) says what's left to do, this says what was learned getting here — the wrong turns,
 the surprising measurements, and the reasoning that isn't obvious from the code alone. All
@@ -458,6 +502,13 @@ from ~3,540 to 2,298 (−35%) project-wide, and specific fragmented units improv
 KB on `CGrenadeLauncher.cpp`, real missing content, not a matching gap) correctly stayed unbridged.
 
 ### A confidently-matched section can still fail comparison because of its *neighbor*, not its own content
+
+**Audit qualification (2026-09-09):** this section's boundary-artifact explanation
+is a hypothesis for mismatches, not something an adjacent auto symbol proves.
+The former script's default link used extracted original objects for candidates,
+so the claimed 25 direct-byte-confirmed promotions below were not independent
+verification of compiled output. The proposed comparison is valid only with
+explicit compiled-object link provenance.
 
 Referenced in this doc's own earlier text (the `CRemoveColorOverrideInstruction.cpp`/vtable
 discussion) but never written up on its own: objdiff's target-side comparison symbol, for a section

@@ -1,5 +1,46 @@
 # Symbol matching: planned work
 
+## Audit update — 2026-09-09
+
+The measurements below are historical, not current guarantees. The external
+workflow now lives in the `dtk-version-matching` repository, alongside the Prime
+checkout, not in Prime's `tools/` directory. Its README and
+`docs/validation_audit.md` describe the corrected process.
+
+The earlier compile-verify loop had a circular validation path: it left new units
+disabled in `configure.py`, then linked their extracted original objects and
+compared those bytes with retail. Consequently its successful retail hash and
+"direct ELF byte comparison" did **not** verify candidate compiled source.
+`metadata.complete` is a build-configuration flag; per-section fuzzy scores are
+comparison results and can omit extra compiler output or ignore relocation
+differences. Neither is a whole-file byte-equality proof.
+
+The corrected workflow separates `discover_splits.py` (retain code splits that
+increase compiler-matched bytes while preserving existing progress and retail
+split integrity) from `verify_source_units.py` (enable compiled objects, check
+their actual linker dependencies, then require both the retail checksum and raw
+DOL equality). Partial code matches are useful without a fully matching file.
+
+The first 100-proposal PAL discovery pass increased matched code from
+256,284 / 3,908,836 bytes (6.5565%) to 648,568 / 3,908,836 (16.5924%), without manual
+target boundary or source-code edits. This is objdiff progress, not 16.59% verified
+source linkage. See the external audit for final source-link results.
+
+Read-only `_00` → `_02` hidden-name calibration with DTK executable SHA-256
+`c627ef0838672a2f10f328c88069a09d50765ec232351d9dd158345160c61b57` checked 1,339 named
+matches: 1,334 agreed and 5 disagreed (99.6266%). Confident-tier agreement was
+1,240 / 1,243 (99.7586%). One disagreement is a compiler-generated array-dtor
+suffix; two others pair unrelated-looking names and remain unadjudicated.
+Do not repeat the historical claim that every confident disagreement is known
+ground-truth noise. `_02` is a useful mixed NTSC/PAL calibration target; PAL is
+still the primary migration target.
+
+Current priorities: improve data/relocation attribution and whole-file boundary
+coverage, record evidence provenance, and distinguish a failed proposal from a
+permanently unmigratable unit. The existing uncommitted `bridge_gap` change was
+left untouched. The existing executable was used without rebuilding; its hash
+above is the precise tool identifier for these measurements.
+
 Notes for extending the [`match`](../README.md#match) command. Written after the initial
 implementation and a round of measurement against the Metroid Prime decompilation, which has seven
 versions of the same executable and is the driving use case.
@@ -60,9 +101,10 @@ Measured with `--validate`, which hides the target's names and scores against th
 | `GM8P01_00` | **791/791 (100%)** | 43/43 (100%) | 7/8 (87.50%) |
 | `R3ME01_00` | **43/43 (100%)** | **33/33 (100%)** | 66/70 (94.29%) |
 
-After the length guard, **no genuinely wrong match remains in the confident tier on any pair**. Every
-confident "error" left is ground-truth noise: truncated names, `CARDStat`/`CardStat` capitalisation
-drift, and `__arraydtor$381`/`__arraydtor$159` compiler-generated suffixes. On the hardest pair all
+At that historical checkpoint, the inspected confident disagreements were attributed
+to ground-truth noise: truncated names, `CARDStat`/`CardStat` capitalisation
+drift, and `__arraydtor$381`/`__arraydtor$159` compiler-generated suffixes. This is not
+a guarantee for current inputs; see the audit above. On the hardest pair all
 four real errors sit in `candidate`, and both trusted tiers are clean.
 
 The guard was not theoretical. It moved ~3,900 matches per close-revision pair out of `confident`
@@ -232,7 +274,12 @@ Re-running against PAL's already-migrated state confirmed the fix live: the thre
 `--splits` correctly dropped from 237 to 8 new confident proposals against the same source/target,
 with the 179 previously-reverted units now showing their real reasons instead of silence.
 
-### Task 3b: verify by compiling, never by asserting — medium, highest workflow value, **implemented prime-side**
+### Task 3b: verify by compiling, never by asserting — historical implementation
+
+**Superseded by the 2026-09-09 audit above.** The historical implementation below
+did not verify that candidate source objects were linked; its claimed byte-level
+guarantee was therefore too strong. The external discovery and source-verification
+scripts now implement separate comparison and whole-file gates.
 
 Built as `tools/split_confidence_loop.py` in the prime repo, not in dtk (correctly — see "needs
 nothing from the matcher itself" below), and matches the loop sketched here closely: stage every
