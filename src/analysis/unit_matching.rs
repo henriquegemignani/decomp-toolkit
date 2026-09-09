@@ -383,7 +383,14 @@ fn bridge_gap(
             return (u == unit).then_some(k);
         }
         match low_confidence.get(&it.index) {
-            Some(u) if u == unit => k += 1,
+            // Fresh positive evidence -- reset the blind-content budget so a
+            // long gap doesn't fail just because *unrelated* blind stretches
+            // on either side of a real, same-unit checkpoint add up past the
+            // cap. Each stretch is judged against the cap on its own.
+            Some(u) if u == unit => {
+                k += 1;
+                blind_bytes = 0;
+            }
             Some(_) => return None,
             None => {
                 if overlaps_split(target, section, it.start, it.end) {
