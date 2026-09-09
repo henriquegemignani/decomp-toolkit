@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
 
-use ppc750cl::Ins;
+use ppc750cl::{Argument, GPR, Ins, Opcode};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::{
-    analysis::callgraph::{CallGraph, FunctionNode},
+    analysis::{
+        callgraph::{CallGraph, FunctionNode},
+        vm::is_load_store_op,
+    },
     obj::{ObjInfo, ObjSectionKind},
 };
 
@@ -118,6 +121,98 @@ pub fn normalized_body(obj: &ObjInfo, node: &FunctionNode) -> Vec<u8> {
     body
 }
 
+/// One instruction whose immediate addresses storage relative to the method's
+/// `this` pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThisRelativeAccess {
+    /// Byte offset of the instruction within the function.
+    pub instruction_offset: u32,
+    /// Effective byte offset from `this`, including any preceding `addi` chain.
+    pub object_offset: i32,
+}
+
+/// A function body with proven `this`-relative immediates cleared in addition
+/// to ordinary relocation fields.
+///
+/// This is deliberately separate from [`normalized_body`]. Exact-body matches
+/// retain their strict meaning, while this representation can detect code that
+/// only changed because a base class inserted or removed fields.
+#[derive(Debug, Clone)]
+pub struct LayoutShiftBody {
+    pub bytes: Vec<u8>,
+    pub accesses: Vec<ThisRelativeAccess>,
+    pub hash: u64,
+}
+
+/// Builds a conservative layout-shift representation for a C++ instance
+/// method. Register `r3` is the incoming `this` pointer. Provenance is carried
+/// through register copies and `addi`; any other definition discards it.
+///
+/// The scan is intentionally conservative rather than a full CFG dataflow.
+/// Seeing a definition on either branch drops provenance for later linear
+/// instructions, which can lose evidence but cannot manufacture a member
+/// access. Calls invalidate volatile registers and preserve nonvolatile ones.
+pub fn layout_shift_body(obj: &ObjInfo, node: &FunctionNode) -> LayoutShiftBody {
+    let body = normalized_body(obj, node);
+    let mut registers = [None; 32];
+    registers[3] = Some(0i32);
+    let mut bytes = Vec::with_capacity(body.len());
+    let mut accesses = Vec::new();
+
+    for (index, chunk) in body.chunks_exact(4).enumerate() {
+        let mut code = u32::from_be_bytes(chunk.try_into().unwrap());
+        let ins = Ins::new(code);
+        let instruction_offset = (index * 4) as u32;
+
+        let copied_this = if ins.op == Opcode::Or && ins.field_rs() == ins.field_rb() {
+            registers[ins.field_rs() as usize]
+        } else {
+            None
+        };
+        let adjusted_this = if ins.op == Opcode::Addi && ins.field_ra() != 0 {
+            registers[ins.field_ra() as usize]
+                .map(|base| base.wrapping_add(ins.field_simm() as i32))
+        } else {
+            None
+        };
+
+        if is_load_store_op(ins.op) && ins.field_ra() != 0 {
+            if let Some(base) = registers[ins.field_ra() as usize] {
+                accesses.push(ThisRelativeAccess {
+                    instruction_offset,
+                    object_offset: base.wrapping_add(ins.field_simm() as i32),
+                });
+                code &= !0xFFFF;
+            }
+        } else if let Some(object_offset) = adjusted_this {
+            accesses.push(ThisRelativeAccess { instruction_offset, object_offset });
+            code &= !0xFFFF;
+        }
+
+        for argument in ins.defs() {
+            if let Argument::GPR(GPR(register)) = argument {
+                registers[register as usize] = None;
+            }
+        }
+        if ins.op == Opcode::Or && ins.field_rs() == ins.field_rb() {
+            registers[ins.field_ra() as usize] = copied_this;
+        } else if ins.op == Opcode::Addi {
+            registers[ins.field_rd() as usize] = adjusted_this;
+        }
+
+        if matches!(ins.op, Opcode::B | Opcode::Bc | Opcode::Bcctr | Opcode::Bclr) && ins.field_lk()
+        {
+            for register in registers.iter_mut().take(13) {
+                *register = None;
+            }
+        }
+        bytes.extend_from_slice(&code.to_be_bytes());
+    }
+
+    let hash = xxhash_rust::xxh3::xxh3_64(&bytes);
+    LayoutShiftBody { bytes, accesses, hash }
+}
+
 /// Collects string literals reachable through the function's data references.
 ///
 /// String contents are among the few things that survive both recompilation and
@@ -173,7 +268,48 @@ fn read_string(data: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obj::ObjRelocKind;
+    use crate::obj::{
+        ObjArchitecture, ObjInfo, ObjKind, ObjRelocKind, ObjRelocations, ObjSection,
+        ObjSectionKind, ObjSplits, ObjSymbol, ObjSymbolKind,
+    };
+
+    fn function_object(words: &[u32]) -> ObjInfo {
+        let data: Vec<u8> = words.iter().flat_map(|word| word.to_be_bytes()).collect();
+        ObjInfo::new(
+            ObjKind::Executable,
+            ObjArchitecture::PowerPc,
+            "test".to_string(),
+            vec![ObjSymbol {
+                name: "Method__5ClassFv".to_string(),
+                address: 0x1000,
+                section: Some(0),
+                size: data.len() as u64,
+                size_known: true,
+                kind: ObjSymbolKind::Function,
+                ..Default::default()
+            }],
+            vec![ObjSection {
+                name: ".text".to_string(),
+                kind: ObjSectionKind::Code,
+                address: 0x1000,
+                size: data.len() as u64,
+                data,
+                align: 4,
+                elf_index: 0,
+                relocations: ObjRelocations::default(),
+                virtual_address: None,
+                file_offset: 0,
+                section_known: true,
+                splits: ObjSplits::default(),
+            }],
+        )
+    }
+
+    fn layout(words: &[u32]) -> LayoutShiftBody {
+        let object = function_object(words);
+        let graph = CallGraph::build(&object);
+        layout_shift_body(&object, graph.node(0))
+    }
 
     #[test]
     fn masking_clears_exactly_the_relocated_bits() {
@@ -187,6 +323,39 @@ mod tests {
 
         // An absolute relocation consumes the entire word.
         assert_eq!(0xDEAD_BEEFu32 & !ObjRelocKind::Absolute.value_mask(), 0);
+    }
+
+    #[test]
+    fn layout_shift_masks_only_proven_this_relative_offsets() {
+        let source = layout(&[
+            0x7C7F_1B78, // mr r31,r3
+            0x809F_0158, // lwz r4,0x158(r31)
+            0x38BF_0160, // addi r5,r31,0x160
+            0x9805_0008, // stb r0,8(r5), effective this+0x168
+            0x80C1_0008, // lwz r6,8(r1), stack access
+            0x4E80_0020, // blr
+        ]);
+        let target =
+            layout(&[0x7C7F_1B78, 0x809F_0168, 0x38BF_0170, 0x9805_0008, 0x80C1_0008, 0x4E80_0020]);
+        assert_eq!(source.bytes, target.bytes);
+        assert_eq!(source.accesses, vec![
+            ThisRelativeAccess { instruction_offset: 4, object_offset: 0x158 },
+            ThisRelativeAccess { instruction_offset: 8, object_offset: 0x160 },
+            ThisRelativeAccess { instruction_offset: 12, object_offset: 0x168 },
+        ]);
+        assert_eq!(
+            target.accesses.iter().map(|access| access.object_offset).collect::<Vec<_>>(),
+            vec![0x168, 0x170, 0x178]
+        );
+    }
+
+    #[test]
+    fn layout_shift_keeps_stack_offsets_distinct() {
+        let source = layout(&[0x8061_0008, 0x4E80_0020]);
+        let target = layout(&[0x8061_0018, 0x4E80_0020]);
+        assert_ne!(source.bytes, target.bytes);
+        assert!(source.accesses.is_empty());
+        assert!(target.accesses.is_empty());
     }
 
     #[test]

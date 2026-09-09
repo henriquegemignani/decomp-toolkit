@@ -373,6 +373,7 @@ Options:
 - `-r`, `--renames <File>`: Output `target_name = source_name` pairs for confident matches only, for target functions that currently have a generated name. Also includes data symbols matched by aligning a confidently-matched function pair's data references. A source symbol marked local scope (e.g. a per-translation-unit template instantiation) carries a trailing `local` word, so the same name can be assigned more than once without colliding.
 - `--candidates <File>`: Output everything short of confident, with alternatives, for review.
 - `--splits <File>`: Output proposed split-unit boundaries, derived from the function matches. See below.
+- `--coverage <File>`: Output versioned JSON evidence for conservative partial translation-unit ownership. Exact-body anchors remain strict. A separate `this`-layout class admits functions whose normalized instructions differ only in proven object-relative immediates, and only when at least two unique functions in one source unit agree on the same inferred offset transformation.
 - `-c`, `--min-confidence <Float>`: Minimum confidence to report a match at all. Default: 0.5
 - `--max-rounds <Int>`: Cap on propagation rounds. Default: 100. Propagation stops on its own once a round finds nothing.
 - `--source-root <Dir>`, `--target-root <Dir>`: Project root each configuration's relative paths resolve against. Defaults to the working directory, falling back to the configuration's own location.
@@ -402,6 +403,15 @@ CPlayer:
 $ dtk match config/GM8E01_00/config.yml config/GM8E01_02/config.yml --splits splits_proposal.txt
 $ dtk splits merge config/GM8E01_02/splits.txt splits_proposal.txt
 ```
+
+`--coverage` is intended for a build-validated migration tool. Layout-shift evidence follows the
+incoming `this` pointer through register copies and `addi`, leaves stack and unrelated immediates
+significant, requires otherwise equal normalized bytes and relocation layouts, and infers a
+monotone transformation with at most one breakpoint. The policy requires two functions, 128 total
+bytes, and four changed accesses in a support group. The JSON report is evidence rather than a
+split edit: a caller must still reject conflicts and verify the linked retail bytes. With
+`--validate`, target names and ownership are omitted from the report so proposals can be scored
+against a separately generated oracle.
 
 ### rel info
 
