@@ -22,6 +22,26 @@ pub enum ObjRelocKind {
     PpcEmbSda21,
 }
 
+impl ObjRelocKind {
+    /// Bits of the target word that the linker overwrites when applying this
+    /// relocation.
+    ///
+    /// Clearing these bits yields the portion of an instruction that stays
+    /// constant regardless of where the target symbol lands, which is what makes
+    /// a function's encoding comparable across builds.
+    pub fn value_mask(self) -> u32 {
+        match self {
+            ObjRelocKind::Absolute => !0,
+            ObjRelocKind::PpcAddr16Hi | ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
+                0xFFFF
+            }
+            ObjRelocKind::PpcRel24 => 0x3FFFFFC,
+            ObjRelocKind::PpcRel14 => 0xFFFC,
+            ObjRelocKind::PpcEmbSda21 => 0x1FFFFF,
+        }
+    }
+}
+
 impl Serialize for ObjRelocKind {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
