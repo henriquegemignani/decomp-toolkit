@@ -8,7 +8,7 @@ use crate::{
     util,
     util::{
         dol::{process_dol, write_dol},
-        elf::{is_elf_file, process_elf, write_elf},
+        elf::{is_elf_file, process_elf},
         file::buf_writer,
         path::native_path,
     },
@@ -67,11 +67,17 @@ fn clean_extab(args: CleanArgs) -> Result<()> {
     };
     let num_cleaned = util::extab::clean_extab(&mut obj, padding.iter().copied())?;
     tracing::debug!("Cleaned {num_cleaned} extab symbols");
-    let mut out = buf_writer(&args.output)?;
     if is_elf {
-        let data = write_elf(&obj, false)?;
-        out.write_all(&data).context("Failed to write ELF")?;
+        // Patch in place: rewriting the ELF would lose .comment flags the linker reads
+        let mut data = open_file(&args.input, true)?.map()?.to_vec();
+        let (_, extab) = obj.sections.by_name("extab")?.context("No extab section found")?;
+        let start = extab.file_offset as usize;
+        data.get_mut(start..start + extab.data.len())
+            .context("extab section out of bounds")?
+            .copy_from_slice(&extab.data);
+        buf_writer(&args.output)?.write_all(&data).context("Failed to write ELF")?;
     } else {
+        let mut out = buf_writer(&args.output)?;
         write_dol(&obj, &mut out).context("Failed to write DOL")?;
     }
     Ok(())
